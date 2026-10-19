@@ -232,6 +232,40 @@ const requestHandler = async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+  // ---- 公开「唤醒/状态页」/wake（云端模式下根路径 / 也走这里）----
+  // 背景：免费容器睡着时，只有"对它的一次真实请求/导航"才会触发平台唤醒。训练营站点用
+  //   隐藏 iframe / 新标签页打开 /wake 来唤醒容器；但浏览器导航没法带上 X-Gesp-Key 头，
+  //   于是被登录墙按匿名 GET 挡下、返回裸 404 "not found"，用户误以为连不上。
+  // 这里单独放行一个免登录的静态页：① 页面友好，明确告诉用户"容器已醒，回站点即可"；
+  //   ② 依然是一次真实的 GET 请求，照常触发容器唤醒。
+  // 安全：此页不暴露账号/口令/编译能力，仅确认容器在跑。
+  // 注意：本机模式(IS_CLOUD=false)下根路径 / 要继续托管整个网站，所以只对 /wake 放行。
+  const WAKE_PATH = req.url.split('?')[0];
+  if (req.method === 'GET' && (WAKE_PATH === '/wake' || (IS_CLOUD && WAKE_PATH === '/'))) {
+    const html = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+      + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+      + '<title>云端 GCC 已就绪</title><style>'
+      + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;'
+      + 'background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",'
+      + 'Roboto,"Microsoft YaHei",sans-serif;text-align:center}'
+      + '.c{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px 26px;'
+      + 'box-shadow:0 10px 30px rgba(0,0,0,.4);width:min(430px,90vw)}'
+      + '.ic{font-size:44px;line-height:1.2}'
+      + 'h1{font-size:19px;margin:6px 0 10px}'
+      + 'p{margin:7px 0;color:#94a3b8;font-size:13.5px;line-height:1.7}'
+      + 'b{color:#e2e8f0}'
+      + '</style></head><body><div class="c">'
+      + '<div class="ic">✅</div><h1>云端 GCC 容器已就绪</h1>'
+      + '<p>这个地址是<b>编译引擎</b>的接口，不是网站首页，<br>所以浏览器里只会显示这一页。</p>'
+      + '<p>直接关掉这个标签页，回到<br><b>GESP C++ 训练营</b>就能写代码运行了。</p>'
+      + '<p style="border-top:1px dashed #334155;padding-top:12px;margin-top:14px">'
+      + '如果训练营里还显示「未连接」，去 <b>⚙️ 引擎</b> 页再点一次 <b>🔄 测试/唤醒连接</b>。</p>'
+      + '</div></body></html>';
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(html);
+    return;
+  }
+
   // 远程编译直通：公网链接上的网页带上正确 X-Gesp-Key（= 登录口令）即可跳过登录墙直接调用 /ping /run；
   // 否则公网来源仍必须登录（避免把本机 g++ 暴露给全网任意编译）。
   const reqKey = (req.headers['x-gesp-key'] || '').toString().trim();
