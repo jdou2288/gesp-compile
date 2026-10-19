@@ -12,7 +12,8 @@ const { spawn } = require('child_process');
 
 // 云端模式（Docker 部署到 Koyeb/Render 等）：用 Linux g++，监听环境变量 $PORT，只暴露 /ping /run 接口。
 // 本地模式（默认）：Windows g++，监听 80，并托管整个网站（同源直连用，方便家里平板）。
-const IS_CLOUD = process.env.CLOUD === '1' || process.env.CLOUD === 'true';
+// 保险：即使云端忘设 CLOUD 环境变量，只要跑在 Linux 上（Docker 里必然是）也自动进入云端模式。
+const IS_CLOUD = process.env.CLOUD === '1' || process.env.CLOUD === 'true' || process.platform === 'linux';
 const PORT = parseInt(process.env.PORT, 10) || (IS_CLOUD ? 3000 : 80);
 const GCC_CANDIDATES = IS_CLOUD
   ? ['/usr/bin/g++', '/usr/bin/g++-12', '/usr/bin/g++-11', 'g++']   // Linux（Docker 里 apt 装 g++）
@@ -97,10 +98,11 @@ function runProc(cmd, args, opts, timeoutMs, inputStr) {
   });
 }
 
-// 云端模式：用 ulimit 给 g++/运行进程加内存(512MB)与 CPU(30s) 上限，防容器被滥用或 OOM。
+// 云端模式：用 ulimit 给 g++/运行进程加内存(384MB)与 CPU(30s) 上限，防容器被滥用或 OOM。
+// 注：SnapDeploy 免费容器总内存 512MB（node 本身占 ~70MB），子进程上限压到 384MB 更稳。
 function wrapCmd(cmd, args) {
   if (!IS_CLOUD) return { cmd: cmd, args: args };
-  return { cmd: 'bash', args: ['-c', 'ulimit -v 524288 -t 30 2>/dev/null; exec "$0" "$@"', cmd].concat(args) };
+  return { cmd: 'bash', args: ['-c', 'ulimit -v 393216 -t 30 2>/dev/null; exec "$0" "$@"', cmd].concat(args) };
 }
 
 async function gccVersion() {
