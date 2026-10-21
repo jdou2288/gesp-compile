@@ -242,6 +242,15 @@ const requestHandler = async (req, res) => {
   // 注意：本机模式(IS_CLOUD=false)下根路径 / 要继续托管整个网站，所以只对 /wake 放行。
   const WAKE_PATH = req.url.split('?')[0];
   if (req.method === 'GET' && (WAKE_PATH === '/wake' || (IS_CLOUD && WAKE_PATH === '/'))) {
+    // 防机器人白醒：要求口令（X-Gesp-Key 头 或 ?key= 查询参数）。匿名 GET（扫描机器人）一律 401，
+    // 不返回唤醒页、也不唤醒容器——只有知道口令的人（你的训练营网页）才能触发唤醒。
+    const _wk = (req.headers['x-gesp-key'] || '').toString().trim();
+    const _qk = (req.url.match(/[?&]key=([^&]+)/) || [])[1] || '';
+    if (_wk !== REMOTE_KEY && decodeURIComponent(_qk) !== REMOTE_KEY) {
+      res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('401 Unauthorized');
+      return;
+    }
     const html = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
       + '<meta name="viewport" content="width=device-width,initial-scale=1">'
       + '<title>云端 GCC 已就绪</title><style>'
