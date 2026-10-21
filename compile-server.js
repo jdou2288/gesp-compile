@@ -346,6 +346,9 @@ const requestHandler = async (req, res) => {
         if (reuse && fs.existsSync(exe)) {
           cached = true;           // 缓存命中：跳过编译
         } else {
+          // 每次编译前都确保缓存目录存在（防系统清理工具删掉 %TEMP%\gesp-exe-cache
+          // 导致 ld.exe "cannot open output file ... No such file or directory"）
+          try { fs.mkdirSync(EXE_CACHE, { recursive: true }); } catch (e) {}
           dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gespcc-'));
           const cpp = path.join(dir, 'main.cpp');
           fs.writeFileSync(cpp, code);
