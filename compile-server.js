@@ -1,5 +1,5 @@
 // GESP local compile server (no deps, Node 18+)
-// Listens on 127.0.0.1:8377 only.
+// Listens on local port 80 (Windows) / $PORT (cloud).
 //   GET  /ping           -> { ok, ver, stds }
 //   POST /run            -> body { code, input, std } -> compile & run with local g++
 // Started by "start-local-compile-server.bat" and "deploy" bat.
@@ -78,15 +78,29 @@ function validCookie(req) {
   return parseCookies(req).gesp_auth === AUTH_TOKEN;
 }
 
+// 超时整组杀进程：Linux 用 killpg（需 detached 进程组），Windows 用 taskkill /T 杀整棵子树，
+// 避免学生程序 / 编译器(cc1plus/ld) 的子进程残留占用端口或文件锁。
+function killTree(pid) {
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true }).on('error', () => {});
+    } else {
+      process.kill(-pid, 'SIGKILL');
+    }
+  } catch (e) {}
+}
 function runProc(cmd, args, opts, timeoutMs, inputStr) {
   return new Promise(resolve => {
     let done = false, stdout = '', stderr = '';
     let p;
-    try { p = spawn(cmd, args, opts); } catch (e) { return resolve({ code: -1, stdout: '', stderr: String(e) }); }
+    const spawnOpts = Object.assign({}, opts || {});
+    if (process.platform !== 'win32') spawnOpts.detached = true; // Linux：独立进程组，超时可整组杀
+    try { p = spawn(cmd, args, spawnOpts); } catch (e) { return resolve({ code: -1, stdout: '', stderr: String(e) }); }
     const to = setTimeout(() => {
       if (done) return;
       done = true;
-      try { p.kill(); } catch (e) {}
+      try { p.kill('SIGKILL'); } catch (e) {}
+      killTree(p.pid);
       resolve({ code: -1, stdout, stderr: stderr + '\n[超时被终止]', timedOut: true });
     }, timeoutMs);
     p.stdout.on('data', d => { if (stdout.length < 200000) stdout += d; });
@@ -111,10 +125,9 @@ async function gccVersion() {
   return (r.stdout.split('\n')[0] || '').trim();
 }
 
-// 同源直连方案：把整个网站也挂在 8377 上（读 dist 目录）。
-// 背景：华为 ArkWeb 等浏览器可能限制"页面里跨端口 fetch"（80 页面请求 8377 接口失败），
-// 但直接访问 8377 的导航不受影响。平板改用 http://电脑IP:8377 打开本站后，
-// 页面与 /ping /run 同源，彻底绕开跨端口/CORS 问题。
+// 同源直连方案：把整个网站也挂在 80 端口上（读 dist 目录），与 /ping /run 接口同源。
+// 背景：华为 ArkWeb 等浏览器可能限制"页面里跨端口 fetch"（同源外的接口请求失败），
+// 平板直接用 http://电脑IP（80，无端口）打开本站后，页面与编译接口同源，彻底绕开跨端口/CORS 问题。
 const WWW_ROOT = path.join(__dirname, 'dist');
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -140,7 +153,9 @@ function serveStatic(res, urlPath, req) {
   if (p === '/' || p === '\\') p = '/index.html';
   if (p === '/index.html') p = '/' + mainHtmlName();
   const full = path.normalize(path.join(WWW_ROOT, p));
-  if (!full.startsWith(WWW_ROOT)) { res.writeHead(403); res.end('forbidden'); return; }
+  const rootNorm = path.normalize(WWW_ROOT);
+  // 必须带路径分隔符校验，否则 dist 的前缀兄弟目录(如 dist_backup)会被 startsWith 漏过、读到网站外文件
+  if (full !== rootNorm && !full.startsWith(rootNorm + path.sep)) { res.writeHead(403); res.end('forbidden'); return; }
   fs.stat(full, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404 not found: ' + p); return; }
     // ETag（弱）：按 文件大小+修改时间 生成，重建后自动变化 → 浏览器重新拉取
