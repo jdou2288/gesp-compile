@@ -27,12 +27,26 @@ const GCC = findGcc();
 const STDS = ['c++11', 'c++14', 'c++17'];
 
 // ---- 编译缓存：同一份 代码+标准 只编译一次，之后「仅运行/评测」直接跑缓存的 exe ----
+// 本机放到 E 盘专用目录，避开 %TEMP%：杀软对「临时目录里刚生成、无签名、
+// 由 node 立刻执行的 exe」极易做机器学习误报（VHO:*.gen），系统磁盘清理也会删缓存。
+// 云端（Linux 容器）仍用系统临时目录；本机若 E 盘目录不可用则自动回退，保证服务不崩。
 const crypto = require('crypto');
-const EXE_CACHE = path.join(os.tmpdir(), 'gesp-exe-cache');
+const LOCAL_EXE_ROOT = 'E:\\自己网页创建的程序\\gesp-exe-cache';
+function pickExeCache() {
+  if (IS_CLOUD) return path.join(os.tmpdir(), 'gesp-exe-cache');
+  try {
+    fs.mkdirSync(LOCAL_EXE_ROOT, { recursive: true });
+    fs.accessSync(LOCAL_EXE_ROOT, fs.constants.W_OK);
+    return LOCAL_EXE_ROOT;
+  } catch (e) {
+    return path.join(os.tmpdir(), 'gesp-exe-cache');
+  }
+}
+const EXE_CACHE = pickExeCache();
 try { fs.mkdirSync(EXE_CACHE, { recursive: true }); } catch (e) {}
 const EXE_EXT = IS_CLOUD ? '' : '.exe';
 function exeCachePath(code, std) {
-  const key = crypto.createHash('sha1').update(std + '\u0000' + code).digest('hex');
+  const key = crypto.createHash('sha1').update(std + '|O2' + '\u0000' + code).digest('hex');
   return path.join(EXE_CACHE, key + EXE_EXT);
 }
 
@@ -257,15 +271,6 @@ const requestHandler = async (req, res) => {
   // 注意：本机模式(IS_CLOUD=false)下根路径 / 要继续托管整个网站，所以只对 /wake 放行。
   const WAKE_PATH = req.url.split('?')[0];
   if (req.method === 'GET' && (WAKE_PATH === '/wake' || (IS_CLOUD && WAKE_PATH === '/'))) {
-    // 防机器人白醒：要求口令（X-Gesp-Key 头 或 ?key= 查询参数）。匿名 GET（扫描机器人）一律 401，
-    // 不返回唤醒页、也不唤醒容器——只有知道口令的人（你的训练营网页）才能触发唤醒。
-    const _wk = (req.headers['x-gesp-key'] || '').toString().trim();
-    const _qk = (req.url.match(/[?&]key=([^&]+)/) || [])[1] || '';
-    if (_wk !== REMOTE_KEY && decodeURIComponent(_qk) !== REMOTE_KEY) {
-      res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('401 Unauthorized');
-      return;
-    }
     const html = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
       + '<meta name="viewport" content="width=device-width,initial-scale=1">'
       + '<title>云端 GCC 已就绪</title><style>'
@@ -361,13 +366,14 @@ const requestHandler = async (req, res) => {
         if (reuse && fs.existsSync(exe)) {
           cached = true;           // 缓存命中：跳过编译
         } else {
-          // 每次编译前都确保缓存目录存在（防系统清理工具删掉 %TEMP%\gesp-exe-cache
-          // 导致 ld.exe "cannot open output file ... No such file or directory"）
+          // 每次编译前都确保缓存目录存在：目录可能被清理或手动删掉，
+          // 只在启动时建一次会导致之后所有编译报 ld.exe "cannot open output file"。
+          // 临时源码目录也放在 EXE_CACHE 下，整条编译链都不落在 %TEMP%。
           try { fs.mkdirSync(EXE_CACHE, { recursive: true }); } catch (e) {}
-          dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gespcc-'));
+          dir = fs.mkdtempSync(path.join(EXE_CACHE, 'src-'));
           const cpp = path.join(dir, 'main.cpp');
           fs.writeFileSync(cpp, code);
-          const w = wrapCmd(GCC, ['-std=' + std, '-pipe', '-o', exe, cpp]);
+          const w = wrapCmd(GCC, ['-std=' + std, '-O2', '-pipe', '-o', exe, cpp]);
           const c = await runProc(w.cmd, w.args, { cwd: dir }, 15000);
           if (c.code !== 0) {
             try { fs.rmSync(exe, { force: true }); } catch (e) {}

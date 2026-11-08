@@ -1,4 +1,5 @@
-# GESP C++ 云端编译服务镜像（Linux g++，仅暴露 /ping /run）
+# GESP C++ 云端编译服务镜像（Linux g++）
+# 接口：GET /ping（心跳）· POST /run（编译运行）· GET /wake（免登录唤醒/状态页）
 FROM node:20-slim
 
 # 安装 g++（GESP 三级按 C++11 标准，本镜像 g++ 12 默认支持 c++11/14/17）
@@ -9,7 +10,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY compile-server.js .
 
-# 云端模式开关：监听 $PORT（平台自动注入），Linux g++, 只暴露 API
+# 云端模式开关：监听 $PORT（平台自动注入），Linux g++，只暴露 API
 ENV CLOUD=1
 
 EXPOSE 3000
