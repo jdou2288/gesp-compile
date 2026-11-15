@@ -113,24 +113,34 @@ function runProc(cmd, args, opts, timeoutMs, inputStr) {
     const to = setTimeout(() => {
       if (done) return;
       done = true;
-      try { p.kill('SIGKILL'); } catch (e) {}
+      // Windows 上必须先杀整棵子树：一旦先 TerminateProcess 干掉父进程，
+      // taskkill /T 就再也枚举不到 cc1plus / as / ld 子进程，会残留并锁住缓存 exe。
       killTree(p.pid);
-      resolve({ code: -1, stdout, stderr: stderr + '\n[超时被终止]', timedOut: true });
+      try { p.kill('SIGKILL'); } catch (e) {}
+      resolve({ code: -1, signal: null, stdout, stderr: stderr + '\n[超时被终止]', timedOut: true });
     }, timeoutMs);
     p.stdout.on('data', d => { if (stdout.length < 200000) stdout += d; });
     p.stderr.on('data', d => { if (stderr.length < 100000) stderr += d; });
     if (inputStr) { try { p.stdin.write(inputStr); } catch (e) {} }
     try { p.stdin.end(); } catch (e) {}
-    p.on('error', e => { if (done) return; done = true; clearTimeout(to); resolve({ code: -1, stdout, stderr: String(e) }); });
-    p.on('close', c => { if (done) return; done = true; clearTimeout(to); resolve({ code: c, stdout, stderr }); });
+    p.on('error', e => { if (done) return; done = true; clearTimeout(to); resolve({ code: -1, signal: null, stdout, stderr: String(e) }); });
+    // 保留 signal：被 SIGABRT(134)/SIGKILL(137)/SIGXCPU(152) 杀死时 code 是 null，
+    // 以前一律填 139，会把 MLE / CPU 型 TLE 全误报成同一个 RE(139)。
+    p.on('close', (c, sig) => {
+      if (done) return;
+      done = true; clearTimeout(to);
+      resolve({ code: c, signal: sig || null, stdout, stderr });
+    });
   });
 }
 
-// 云端模式：用 ulimit 给 g++/运行进程加内存(384MB)与 CPU(30s) 上限，防容器被滥用或 OOM。
-// 注：SnapDeploy 免费容器总内存 512MB（node 本身占 ~70MB），子进程上限压到 384MB 更稳。
-function wrapCmd(cmd, args) {
+// 云端模式：给运行进程加内存(384MB)与 CPU(30s) 上限，防容器被滥用或 OOM。
+// 注意：编译阶段不能限制虚拟地址空间——cc1plus 编译 <bits/stdc++.h> 时 VSZ 常超 384MB，
+// ulimit -v 会直接杀掉编译器并伪装成「编译失败」。内存限制只施加到学生程序的运行阶段。
+function wrapCmd(cmd, args, memLimit) {
   if (!IS_CLOUD) return { cmd: cmd, args: args };
-  return { cmd: 'bash', args: ['-c', 'ulimit -v 393216 -t 30 2>/dev/null; exec "$0" "$@"', cmd].concat(args) };
+  const lim = memLimit ? 'ulimit -v 393216 -t 30 2>/dev/null; ' : 'ulimit -t 30 2>/dev/null; ';
+  return { cmd: 'bash', args: ['-c', lim + 'exec "$0" "$@"', cmd].concat(args) };
 }
 
 async function gccVersion() {
@@ -172,40 +182,49 @@ function serveStatic(res, urlPath, req) {
   if (full !== rootNorm && !full.startsWith(rootNorm + path.sep)) { res.writeHead(403); res.end('forbidden'); return; }
   fs.stat(full, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404 not found: ' + p); return; }
-    // ETag（弱）：按 文件大小+修改时间 生成，重建后自动变化 → 浏览器重新拉取
-    const etag = 'W/"' + st.size.toString(36) + '-' + Math.floor(st.mtimeMs).toString(36) + '"';
-    const inm = req && req.headers['if-none-match'];
-    if (inm === etag) { res.writeHead(304); res.end(); return; }
-    const ext = path.extname(full).toLowerCase();
-    const type = MIME[ext] || 'application/octet-stream';
-    const headers = {
-      'Content-Type': type,
-      'ETag': etag,
-      // 同源直连 + 公网 Funnel 都走这里；静态资源给 5 分钟缓存（重建后 ETag 变会自动更新）
-      'Cache-Control': 'public, max-age=300'
-    };
-    // 预压缩（build_single.js 构建时已生成 .br / .gz 配套文件）：
-    //   优先 Brotli（比 gzip 再小约 1/3），其次 gzip，最后原始；服务端零运行时压缩开销。
+    // 先决定内容编码：ETag 必须随编码变化并声明 Vary，
+    // 否则同一 URL 的 br/gzip/raw 三种响应共用一个 ETag，共享缓存可能发错编码导致页面乱码。
     const accept = (req && req.headers['accept-encoding'] || '').toLowerCase();
     let encFile = null, encoding = null;
     if (/\bbr\b/.test(accept) && fs.existsSync(full + '.br')) { encFile = full + '.br'; encoding = 'br'; }
     else if (/\bgzip\b/.test(accept) && fs.existsSync(full + '.gz')) { encFile = full + '.gz'; encoding = 'gzip'; }
-    const send = (buf) => {
-      if (encoding) headers['Content-Encoding'] = encoding;
-      headers['Content-Length'] = buf.length;
-      res.writeHead(200, headers);
+    // ETag（弱）：按 文件大小+修改时间+编码 生成，重建后自动变化 → 浏览器重新拉取
+    const etag = 'W/"' + st.size.toString(36) + '-' + Math.floor(st.mtimeMs).toString(36) + '-' + (encoding || 'raw') + '"';
+    const inm = req && req.headers['if-none-match'];
+    // 登录墙按 Cookie 区分「登录页」与「正式页面」，共享缓存必须把 Cookie 纳入 Vary，
+    // 否则中间层会把已登录的题库页缓存下来发给未登录访客。
+    const VARY = 'Accept-Encoding, Cookie';
+    if (inm === etag) { res.writeHead(304, { 'Vary': VARY, 'Cache-Control': 'private, max-age=0' }); res.end(); return; }
+    const ext = path.extname(full).toLowerCase();
+    const type = MIME[ext] || 'application/octet-stream';
+    // 用 private：本服务的内容受登录态影响，不能被 CDN/代理按 public 缓存复用。
+    const headers = {
+      'Content-Type': type,
+      'ETag': etag,
+      'Vary': VARY,
+      'Cache-Control': 'private, max-age=300'
+    };
+    // 预压缩（build_single.js 构建时已生成 .br / .gz 配套文件）：
+    //   优先 Brotli（比 gzip 再小约 1/3），其次 gzip，最后原始；服务端零运行时压缩开销。
+    // raw=true 表示回退到未压缩原文，此时绝不能带 Content-Encoding，也不能复用含 'br' 的 ETag。
+    const send = (buf, raw) => {
+      const h = Object.assign({}, headers);
+      if (raw) { delete h['Content-Encoding']; h['ETag'] = etag.replace(/-(br|gzip)"$/, '-raw"'); }
+      else if (encoding) h['Content-Encoding'] = encoding;
+      h['Content-Length'] = buf.length;
+      res.writeHead(200, h);
       res.end(buf);
     };
     if (encFile) {
       fs.readFile(encFile, (rerr, buf) => {
-        if (rerr) { // 预压文件意外缺失 → 退回原始文件
-          fs.readFile(full, (e2, b2) => { if (e2) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404'); } else send(b2); });
-        } else send(buf);
+        if (rerr) { // 预压文件意外缺失 → 退回原始文件（必须按未压缩发送）
+          fs.readFile(full, (e2, b2) => { if (e2) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404'); } else send(b2, true); });
+        } else send(buf, false);
       });
     } else {
       fs.readFile(full, (rerr, buf) => {
         if (rerr) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404 not found: ' + p); return; }
-        send(buf);
+        send(buf, !encoding);
       });
     }
   });
@@ -363,9 +382,16 @@ const requestHandler = async (req, res) => {
       try {
         const t0 = Date.now();
         let cached = false;
-        if (reuse && fs.existsSync(exe)) {
+        // 只认「非空且可执行」的缓存：编译被强杀/断电可能留下 0 字节或半截 exe，
+        // 以前只要 existsSync 就永远命中，之后每次复用都会异常且无法自愈。
+        let stat = null;
+        try { stat = fs.statSync(exe); } catch (e) {}
+        const exeUsable = stat && stat.isFile() && stat.size > 1024;
+        if (reuse && exeUsable) {
           cached = true;           // 缓存命中：跳过编译
         } else {
+          if (reuse && stat) { try { fs.rmSync(exe, { force: true }); } catch (e) {} }  // 坏缓存删掉，强制重编译
+
           // 每次编译前都确保缓存目录存在：目录可能被清理或手动删掉，
           // 只在启动时建一次会导致之后所有编译报 ld.exe "cannot open output file"。
           // 临时源码目录也放在 EXE_CACHE 下，整条编译链都不落在 %TEMP%。
@@ -378,15 +404,24 @@ const requestHandler = async (req, res) => {
           if (c.code !== 0) {
             try { fs.rmSync(exe, { force: true }); } catch (e) {}
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ compileErr: c.stderr || 'compilation failed' }));
+            // 编译超时要单独回传，别伪装成「编译失败」把排错方向带偏
+            res.end(JSON.stringify({
+              compileErr: c.timedOut ? '编译超时（超过 15 秒）：检查是否写了极重的模板/递归实例化' : (c.stderr || 'compilation failed'),
+              timedOut: !!c.timedOut
+            }));
             return;
           }
         }
-        const w = wrapCmd(exe, []);
+        const w = wrapCmd(exe, [], true);   // 内存上限只施加到运行阶段
         const r = await runProc(w.cmd, w.args, { cwd: dir || EXE_CACHE }, 6000, input);
+        // Linux 下进程被信号终止时 Node 的 close 回调 code 为 null；归一化为非零，
+        // 否则前端 typeof null !== 'number' 会把崩溃误判成 WA（本地却是 RE）。
+        // 按真实信号映射，别把 SIGABRT(134)/SIGKILL(137)/SIGXCPU(152) 都塞成 139。
+        const SIGNO = { SIGABRT: 134, SIGKILL: 137, SIGFPE: 136, SIGSEGV: 139, SIGXCPU: 152, SIGXFSZ: 153, SIGTERM: 143 };
+        const exitCode = (r.code === null || r.code === undefined) ? (SIGNO[r.signal] || 139) : r.code;
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
-          out: r.stdout, err: r.stderr, code: r.code,
+          out: r.stdout, err: r.stderr, code: exitCode, signal: r.signal || null,
           timedOut: !!r.timedOut, std: std, ms: Date.now() - t0, cached: cached
         }));
       } catch (e) {
